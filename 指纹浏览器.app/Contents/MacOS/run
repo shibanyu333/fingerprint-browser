@@ -1,0 +1,104 @@
+#!/bin/bash
+# 指纹浏览器 —— 双击启动。
+# 做三件事：找到程序目录 → 确保后台服务在跑 → 用无地址栏的窗口打开管理界面。
+
+APP_BUNDLE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PORT=3131
+URL="http://127.0.0.1:$PORT"
+TITLE="指纹浏览器"
+
+die() {
+  osascript -e "display dialog \"$1\" buttons {\"好\"} default button 1 with icon stop with title \"$TITLE\"" >/dev/null 2>&1
+  exit 1
+}
+
+# 程序目录：优先用安装时的位置，其次假设 .app 就放在程序目录里面
+PROJECT="/Users/shibanyu/指纹"
+if [ ! -f "$PROJECT/server/index.js" ]; then
+  PROJECT="$(dirname "$APP_BUNDLE")"
+fi
+[ -f "$PROJECT/server/index.js" ] || die "找不到程序文件。\n\n这个 App 需要和「指纹」文件夹放在一起，或者把文件夹放回 /Users/shibanyu/指纹。"
+
+# 从 GUI 启动时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin，
+# nvm / homebrew / hermes 装的 node 一个都不在里面，只能挨个位置找。
+find_node() {
+  local c
+  # 先看 PATH（从终端启动时能命中）
+  c="$(command -v node 2>/dev/null)"
+  [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
+
+  # 常见的用户级安装位置
+  for c in "$HOME/.local/bin/node" "$HOME/.hermes/node/bin/node" \
+           /opt/homebrew/bin/node /usr/local/bin/node \
+           "$HOME/.volta/bin/node" "$HOME/.bun/bin/node" /opt/local/bin/node; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+
+  # nvm 可能装了很多版本，取版本号最大的那个（glob 升序展开，末尾即最新）
+  local nvm_latest=""
+  for c in "$HOME"/.nvm/versions/node/*/bin/node; do
+    [ -x "$c" ] && nvm_latest="$c"
+  done
+  [ -n "$nvm_latest" ] && { echo "$nvm_latest"; return; }
+
+  # 最后兜底：登录 shell 里通常能解析出来
+  c="$(/bin/bash -lc 'command -v node' 2>/dev/null | tail -1)"
+  [ -n "$c" ] && [ -x "$c" ] && echo "$c"
+}
+
+NODE="$(find_node)"
+[ -n "$NODE" ] || die "没有找到 Node.js。\n\n请先到 https://nodejs.org 安装 Node.js 20 以上版本，然后重新打开本应用。"
+
+# 版本太低会因为语法不支持而启动失败，提前给个看得懂的提示
+NODE_MAJOR="$("$NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null)"
+if [ -n "$NODE_MAJOR" ] && [ "$NODE_MAJOR" -lt 20 ] 2>/dev/null; then
+  die "Node.js 版本过低（当前 v$NODE_MAJOR，需要 20 以上）。\n\n找到的位置：$NODE"
+fi
+
+mkdir -p "$PROJECT/data"
+
+# 服务已经在跑就直接复用，不重复启动
+STARTED_HERE=""
+if ! curl -s -m 2 "$URL/api/state" >/dev/null 2>&1; then
+  cd "$PROJECT" || die "无法进入程序目录"
+  "$NODE" server/index.js >> "$PROJECT/data/server.log" 2>&1 &
+  SERVER_PID=$!
+  STARTED_HERE=1
+  for _ in $(seq 1 40); do
+    curl -s -m 1 "$URL/api/state" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if ! curl -s -m 2 "$URL/api/state" >/dev/null 2>&1; then
+    die "后台服务启动失败。\n\n错误信息见：$PROJECT/data/server.log"
+  fi
+fi
+
+# 用自带的 Chromium 以「应用窗口」模式显示界面：没有地址栏和标签栏，像个独立程序。
+# 单独的 user-data-dir，跟各个业务环境完全隔离。
+UI_BROWSER="$PROJECT/browsers/FingerprintChromium-148.app/Contents/MacOS/Chromium"
+[ -x "$UI_BROWSER" ] || UI_BROWSER="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+if [ -x "$UI_BROWSER" ]; then
+  "$UI_BROWSER" \
+    --app="$URL" \
+    --user-data-dir="$PROJECT/data/ui-window" \
+    --no-first-run --no-default-browser-check --use-mock-keychain \
+    --no-service-autorun --disable-session-crashed-bubble \
+    --window-size=1500,940 >/dev/null 2>&1
+else
+  # 实在没有可用浏览器，退回系统默认浏览器
+  open "$URL"
+  osascript -e "display dialog \"界面已在默认浏览器中打开。\n\n关掉这个提示会同时关闭后台服务。\" buttons {\"结束运行\"} default button 1 with title \"$TITLE\"" >/dev/null 2>&1
+fi
+
+# 界面窗口关掉之后：还有环境开着就让服务继续跑，否则收工。
+# 直接杀掉服务会连带关闭所有正在用的店铺环境，那样会丢登录态。
+RUNNING=$("$NODE" -e "
+fetch('$URL/api/state').then(r=>r.json()).then(j=>console.log(j.runningCount||0)).catch(()=>console.log(0))
+" 2>/dev/null | tail -1)
+
+if [ "${RUNNING:-0}" -gt 0 ] 2>/dev/null; then
+  osascript -e "display notification \"还有 ${RUNNING} 个环境在运行，后台服务继续保持。再次打开本应用可回到管理界面。\" with title \"$TITLE\"" >/dev/null 2>&1
+elif [ -n "$STARTED_HERE" ]; then
+  kill "$SERVER_PID" 2>/dev/null
+fi

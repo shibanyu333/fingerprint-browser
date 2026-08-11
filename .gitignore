@@ -1,0 +1,5 @@
+node_modules/
+data/
+profiles/
+browsers/
+*.dmg

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>指纹浏览器 · 多账号环境管理</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>指纹浏览器</h1>
+        <p>多账号防关联环境管理</p>
+      </div>
+
+      <div>
+        <div class="nav-title">
+          <span>分组</span>
+          <button id="add-group" title="新建分组">+</button>
+        </div>
+        <div id="group-list"></div>
+      </div>
+
+      <div>
+        <div class="nav-title"><span>管理</span></div>
+        <div class="nav-item" data-view="proxies"><span>代理池</span><span class="count" id="proxy-count">0</span></div>
+        <div class="nav-item" data-view="engines"><span>浏览器内核</span></div>
+        <div class="nav-item" data-view="settings"><span>设置与备份</span></div>
+      </div>
+
+      <div class="spacer"></div>
+      <div class="sub" style="padding:0 8px" id="foot-status"></div>
+    </aside>
+
+    <main class="main">
+      <div class="topbar" id="topbar"></div>
+      <div class="content" id="content"></div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <div class="toasts" id="toasts"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
