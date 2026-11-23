@@ -38,7 +38,7 @@ export function load() {
     } catch (err) {
       // A corrupt db would silently wipe every saved profile, so keep the bad file around.
       const backup = `${DB_FILE}.broken-${Date.now()}`;
-      fs.copyFileSync(DB_FILE, backup);
+      fs.writeFileSync(backup, fs.readFileSync(DB_FILE), { mode: 0o600, flag: 'wx' });
       console.error(`[store] db.json 解析失败，已备份到 ${backup}，本次以空库启动`);
       db = structuredClone(DEFAULTS);
     }
@@ -49,50 +49,51 @@ export function load() {
   return db;
 }
 
-export function save() {
+export function save(next = db) {
   ensureDirs();
-  const tmp = `${DB_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-  fs.renameSync(tmp, DB_FILE);
+  const tmp = `${DB_FILE}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, DB_FILE);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
 }
 
 export function newId(prefix = 'p') {
   return `${prefix}_${crypto.randomBytes(6).toString('hex')}`;
 }
 
+export function isProfileId(id) {
+  return typeof id === 'string' && /^[a-z0-9_-]+$/i.test(id);
+}
+
 export function profileDir(id) {
+  if (!isProfileId(id)) throw new Error('环境 ID 格式无效');
   return path.join(PROFILE_DIR, id);
 }
 
 export function removeProfileDir(id) {
-  const dir = profileDir(id);
-  if (dir.startsWith(PROFILE_DIR) && fs.existsSync(dir)) {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+  fs.rmSync(profileDir(id), { recursive: true, force: true });
 }
 
-export function profileDirSize(id) {
-  const dir = profileDir(id);
+export async function profileDirSize(id) {
+  const pending = [profileDir(id)];
   let total = 0;
-  const walk = (p) => {
-    let entries;
+  while (pending.length) {
+    const entry = pending.pop();
     try {
-      entries = fs.readdirSync(p, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const full = path.join(p, e.name);
-      if (e.isDirectory()) walk(full);
-      else {
-        try {
-          total += fs.statSync(full).size;
-        } catch {
-          /* file vanished mid-walk */
+      const stat = await fs.promises.lstat(entry);
+      if (stat.isDirectory()) {
+        for (const child of await fs.promises.readdir(entry)) {
+          pending.push(path.join(entry, child));
         }
+      } else if (stat.isFile()) {
+        total += stat.size;
       }
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
     }
-  };
-  if (fs.existsSync(dir)) walk(dir);
+  }
   return total;
 }

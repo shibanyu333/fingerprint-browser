@@ -7,9 +7,12 @@ import { resolveEngine } from './engines.js';
 import { uaPreview, localeForCountry } from './fingerprint.js';
 import { checkProxy } from './ipcheck.js';
 import { attachPatches } from './cdp-stealth.js';
+import { once } from 'node:events';
 
 /** profileId -> 运行态 */
 export const running = new Map();
+const starting = new Map();
+const closing = new Map();
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -102,7 +105,7 @@ function buildArgs(profile, engine, ctx) {
   if (fp.customArgs) {
     for (const a of String(fp.customArgs).split(/\s+/).filter(Boolean)) args.push(a);
   }
-  if (profile.startUrl) args.push(profile.startUrl);
+  if (profile.startUrl) args.push('--', profile.startUrl);
   return args;
 }
 
@@ -162,7 +165,7 @@ function withAppleLanguages(engine, fp, spawnFn) {
 
   const run = langLock.chain.then(async () => {
     await setAppleLanguages(bundleId, langs);
-    const result = spawnFn();
+    const result = await spawnFn();
     // 给子进程读完 NSUserDefaults 的时间，之后才允许下一个环境改写这个域
     await new Promise((r) => setTimeout(r, 700));
     return result;
@@ -178,6 +181,8 @@ export function isRunning(id) {
     process.kill(r.pid, 0);
     return true;
   } catch {
+    r.relay?.close();
+    r.detachStealth?.();
     running.delete(id);
     return false;
   }
@@ -189,8 +194,20 @@ export function isRunning(id) {
  * 所以除非显式 force，否则检测不过直接拒绝启动。
  */
 export async function launchProfile(profile, opts = {}) {
+  if (closing.has(profile.id)) throw new Error('该环境正在关闭');
+  if (starting.has(profile.id)) throw new Error('该环境正在启动');
   if (isRunning(profile.id)) throw new Error('该环境已经在运行中');
 
+  const pending = startProfile(profile, opts);
+  starting.set(profile.id, pending);
+  try {
+    return await pending;
+  } finally {
+    starting.delete(profile.id);
+  }
+}
+
+async function startProfile(profile, opts) {
   const db = load();
   const engine = resolveEngine(opts.engineId || profile.engineId || db.settings.defaultEngine);
   if (!engine) throw new Error('没有可用的浏览器内核，请先到「内核管理」下载');
@@ -218,13 +235,6 @@ export async function launchProfile(profile, opts = {}) {
     }
   }
 
-  let relay = null;
-  let relayPort = 0;
-  if (upstream) {
-    relay = new Relay(profile.proxy, profile.name);
-    relayPort = await relay.listen();
-  }
-
   // 屏幕分辨率伪装要靠 CDP，所以开着它就必须有调试端口。
   // 实测开着调试端口并不会被识破：BrowserScan 判 Bot Detection=No，
   // CreepJS 报 0% stealth，Pixelscan 报 no automated behavior —— 内核做过 CDP 反检测。
@@ -238,9 +248,22 @@ export async function launchProfile(profile, opts = {}) {
   const win = await gridPosition(opts.index || 0, grid);
 
   fs.mkdirSync(profileDir(profile.id), { recursive: true });
-  const args = buildArgs({ ...profile, fingerprint: fp }, engine, { relayPort, cdpPort, win });
-
-  const proc = await withAppleLanguages(engine, fp, () => spawn(engine.path, args, { stdio: 'ignore', detached: false }));
+  const relay = upstream ? new Relay(profile.proxy, profile.name) : null;
+  let relayPort = 0;
+  let proc;
+  try {
+    if (relay) relayPort = await relay.listen();
+    const args = buildArgs({ ...profile, fingerprint: fp }, engine, { relayPort, cdpPort, win });
+    proc = await withAppleLanguages(engine, fp, async () => {
+      const child = spawn(engine.path, args, { stdio: 'ignore', detached: false });
+      await once(child, 'spawn');
+      return child;
+    });
+    if (proc.exitCode !== null || proc.signalCode !== null) throw new Error('浏览器进程启动后立即退出');
+  } catch (err) {
+    relay?.close();
+    throw err;
+  }
 
   const state = {
     pid: proc.pid,
@@ -274,8 +297,8 @@ export async function launchProfile(profile, opts = {}) {
     const mode = engine.kind === 'system' ? 'full' : 'screen';
     attachPatches(cdpPort, fp, uaPreview(fp), mode)
       .then((detach) => {
-        const cur = running.get(profile.id);
-        if (cur) cur.detachStealth = detach;
+        if (running.get(profile.id) === state) state.detachStealth = detach;
+        else detach();
       })
       .catch((err) => console.error(`[patch] ${profile.name}: ${err.message}`));
   }
@@ -286,13 +309,29 @@ export async function launchProfile(profile, opts = {}) {
     stored.lastRunAt = Date.now();
     stored.lastIpInfo = ipInfo;
     stored.appliedFingerprint = { lang: fp.lang, timezone: fp.timezone };
-    save();
+    try {
+      save();
+    } catch (err) {
+      console.error('[launcher] 无法保存最近运行记录', err);
+    }
   }
 
   return { pid: proc.pid, cdpPort, relayPort, engine: engine.name, ipInfo };
 }
 
 export async function closeProfile(id) {
+  if (closing.has(id)) return closing.get(id);
+  const pending = stopProfile(id);
+  closing.set(id, pending);
+  try {
+    return await pending;
+  } finally {
+    closing.delete(id);
+  }
+}
+
+async function stopProfile(id) {
+  await starting.get(id)?.catch(() => {});
   const r = running.get(id);
   if (!r) return { ok: false, message: '环境未在运行' };
 
@@ -305,8 +344,7 @@ export async function closeProfile(id) {
   // 给 Chromium 一点时间把 cookie / localStorage 落盘，硬杀会丢登录态
   await new Promise((resolve) => setTimeout(resolve, 1500));
   try {
-    process.kill(r.pid, 0);
-    process.kill(r.pid, 'SIGKILL');
+    if (running.get(id) === r) process.kill(r.pid, 'SIGKILL');
   } catch {
     /* 已正常退出 */
   }
@@ -318,9 +356,9 @@ export async function closeProfile(id) {
 }
 
 export async function closeAll() {
-  const ids = [...running.keys()];
-  for (const id of ids) await closeProfile(id);
-  return ids.length;
+  const ids = new Set([...running.keys(), ...starting.keys(), ...closing.keys()]);
+  const results = await Promise.all([...ids].map(closeProfile));
+  return results.filter((result) => result.ok).length;
 }
 
 /**

@@ -1,19 +1,52 @@
 import express from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
-import { load, save, newId, ROOT, removeProfileDir, profileDirSize } from './store.js';
+import { load, save, newId, ROOT, isProfileId, removeProfileDir, profileDirSize } from './store.js';
 import { buildFingerprint, randomSeed, uaPreview, platformOptions, brandOptions, SCREEN_PRESETS, LOCALE_BY_COUNTRY } from './fingerprint.js';
-import { listEngines, installEngine, installState, resolveEngine } from './engines.js';
+import { listEngines, installEngine, installState } from './engines.js';
 import { checkProxy } from './ipcheck.js';
 import { launchProfile, closeProfile, closeAll, isRunning, runtimeInfo, adoptOrphans, running } from './launcher.js';
 
 const db = load();
 const app = express();
-app.use(express.json({ limit: '20mb' }));
-app.use(express.static(path.join(ROOT, 'web')));
+app.disable('x-powered-by');
+app.set('query parser', 'simple');
 
 const ok = (res, data = {}) => res.json({ ok: true, ...data });
 const fail = (res, err, code = 400) => res.status(code).json({ ok: false, error: String(err?.message || err) });
+let ready = false;
+
+app.use((req, res, next) => {
+  res.set({
+    'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+  });
+  const host = req.get('Host')?.toLowerCase();
+  if (!/^(127\.0\.0\.1|localhost)(:\d{1,5})?$/.test(host || '')) {
+    return fail(res, '只接受本机管理端地址', 403);
+  }
+  next();
+});
+
+app.use('/api', (req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  const origin = `http://${req.get('Host').toLowerCase()}`;
+  const requestOrigin = req.get('Origin');
+  const referer = req.get('Referer');
+  const site = req.get('Sec-Fetch-Site');
+  if ((requestOrigin && requestOrigin !== origin)
+    || (referer && !referer.startsWith(`${origin}/`))
+    || (site && site !== 'same-origin' && site !== 'none')) {
+    return fail(res, '管理 API 只接受同源网页或本机客户端请求', 403);
+  }
+  if (!ready) return fail(res, '正在初始化管理端', 503);
+  next();
+});
+
+app.get('/api/health', (_req, res) => ok(res, { service: 'fingerprint-browser' }));
+app.use('/api', express.json({ limit: '20mb' }));
+app.use(express.static(path.join(ROOT, 'web')));
 
 /** 环境可以直接写死代理，也可以引用代理池里的条目 */
 export function resolveProxy(profile) {
@@ -36,9 +69,30 @@ function withRuntime(profile) {
     running: isRunning(profile.id),
     runtime: runtimeInfo(profile.id),
     ua: uaPreview(profile.fingerprint),
-    proxyLabel: proxy ? `${proxy.type}://${proxy.host}:${proxy.port}` : '不使用代理（直连本机 IP）',
+    proxyLabel: proxy ? `${proxy.type}://${proxy.host}:${proxy.port}`
+      : hasProxyBinding(profile) ? '代理配置缺失，请重新绑定' : '不使用代理（直连本机 IP）',
     proxyResolved: !!proxy,
   };
+}
+
+function hasProxyBinding(profile) {
+  return profile.proxy?.mode === 'pool' || profile.proxy?.mode === 'custom';
+}
+
+const deleting = new Set();
+
+function launchConfiguredProfile(profile, opts) {
+  if (deleting.has(profile.id)) throw new Error('该环境正在删除');
+  const proxy = resolveProxy(profile);
+  if (hasProxyBinding(profile)) {
+    if (!proxy) throw new Error('代理配置缺失，请重新绑定代理');
+    const port = Number(proxy.port);
+    if (!['socks', 'socks4', 'socks5', 'http', 'https'].includes(String(proxy.type).toLowerCase())
+      || !String(proxy.host || '').trim() || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('绑定的代理配置无效，请检查类型、地址和端口');
+    }
+  }
+  return launchProfile({ ...profile, proxy }, opts);
 }
 
 // ---------------------------------------------------------------- 读取状态
@@ -64,8 +118,13 @@ app.get('/api/options', (_req, res) => {
   });
 });
 
-app.get('/api/profiles/:id/size', (req, res) => {
-  ok(res, { bytes: profileDirSize(req.params.id) });
+app.get('/api/profiles/:id/size', async (req, res, next) => {
+  if (!isProfileId(req.params.id)) return fail(res, '环境 ID 格式无效');
+  try {
+    ok(res, { bytes: await profileDirSize(req.params.id) });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ---------------------------------------------------------------- 环境增删改
@@ -157,14 +216,24 @@ app.post('/api/profiles/:id/reseed', (req, res) => {
   ok(res, { profile: withRuntime(p) });
 });
 
-app.delete('/api/profiles/:id', async (req, res) => {
-  const idx = db.profiles.findIndex((x) => x.id === req.params.id);
-  if (idx === -1) return fail(res, '环境不存在', 404);
-  if (isRunning(req.params.id)) await closeProfile(req.params.id);
-  db.profiles.splice(idx, 1);
-  if (req.query.purge === '1') removeProfileDir(req.params.id);
-  save();
-  ok(res);
+app.delete('/api/profiles/:id', async (req, res, next) => {
+  const { id } = req.params;
+  if (!isProfileId(id)) return fail(res, '环境 ID 格式无效');
+  if (!db.profiles.some((p) => p.id === id)) return fail(res, '环境不存在', 404);
+  if (deleting.has(id)) return fail(res, '该环境正在删除', 409);
+  deleting.add(id);
+  try {
+    await closeProfile(id);
+    const profiles = db.profiles.filter((p) => p.id !== id);
+    if (req.query.purge === '1') removeProfileDir(id);
+    save({ ...db, profiles });
+    db.profiles = profiles;
+    ok(res);
+  } catch (err) {
+    next(err);
+  } finally {
+    deleting.delete(id);
+  }
 });
 
 // ---------------------------------------------------------------- 打开 / 关闭
@@ -173,7 +242,7 @@ app.post('/api/profiles/:id/launch', async (req, res) => {
   const p = db.profiles.find((x) => x.id === req.params.id);
   if (!p) return fail(res, '环境不存在', 404);
   try {
-    const info = await launchProfile({ ...p, proxy: resolveProxy(p) }, { force: !!req.body?.force, index: Number(req.body?.index) || 0 });
+    const info = await launchConfiguredProfile(p, { force: !!req.body?.force, index: Number(req.body?.index) || 0 });
     ok(res, { info });
   } catch (err) {
     fail(res, err);
@@ -190,6 +259,7 @@ app.post('/api/profiles/:id/close', async (req, res) => {
 
 app.post('/api/batch/launch', async (req, res) => {
   const ids = req.body?.ids || [];
+  if (!Array.isArray(ids)) return fail(res, '环境 ID 必须为数组');
   const force = !!req.body?.force;
   const results = [];
   let slot = 0;
@@ -201,7 +271,7 @@ app.post('/api/batch/launch', async (req, res) => {
       continue;
     }
     try {
-      const info = await launchProfile({ ...p, proxy: resolveProxy(p) }, { force, index: slot });
+      const info = await launchConfiguredProfile(p, { force, index: slot });
       results.push({ id, name: p.name, ok: true, info });
       slot += 1;
       // 错开一点，避免十几个 Chromium 同时冷启动把机器打满
@@ -215,7 +285,8 @@ app.post('/api/batch/launch', async (req, res) => {
 
 app.post('/api/batch/close', async (req, res) => {
   const ids = req.body?.ids || [];
-  for (const id of ids) await closeProfile(id).catch(() => {});
+  if (!Array.isArray(ids)) return fail(res, '环境 ID 必须为数组');
+  await Promise.all([...new Set(ids)].map((id) => closeProfile(id).catch(() => {})));
   ok(res);
 });
 
@@ -282,7 +353,7 @@ app.delete('/api/proxies/:id', (req, res) => {
   if (idx === -1) return fail(res, '代理不存在', 404);
   const inUse = db.profiles.filter((p) => p.proxy?.mode === 'pool' && p.proxy.poolId === req.params.id);
   if (inUse.length && req.query.force !== '1') {
-    return fail(res, `有 ${inUse.length} 个环境正在用这条代理：${inUse.map((p) => p.name).join('、')}`);
+    return fail(res, `有 ${inUse.length} 个环境正在用这条代理：${inUse.map((p) => p.name).join('、')}`, 409);
   }
   db.proxies.splice(idx, 1);
   save();
@@ -296,13 +367,15 @@ app.post('/api/proxies/import', (req, res) => {
   const added = [];
   const errors = [];
 
+  let lineNumber = 0;
   for (const rawLine of text.split('\n')) {
+    lineNumber += 1;
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) continue;
     try {
       added.push(parseProxyLine(line, defType));
     } catch (err) {
-      errors.push(`${line} —— ${err.message}`);
+      errors.push(`第 ${lineNumber} 行：${err.message}`);
     }
   }
   for (const a of added) {
@@ -340,7 +413,7 @@ function parseProxyLine(line, defType) {
   if (parts.length < 2) throw new Error('格式不认识，至少要有 host:port');
   const host = parts[0];
   const port = Number(parts[1]);
-  if (!host || !Number.isFinite(port) || port <= 0 || port > 65535) throw new Error('端口不合法');
+  if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) throw new Error('地址或端口不合法');
   // host:port:user:pass 这种写法
   if (parts.length >= 4 && !username) {
     username = parts[2];
@@ -381,7 +454,10 @@ app.delete('/api/groups/:id', (req, res) => {
 
 app.post('/api/batch/move-group', (req, res) => {
   const { ids = [], group = 'default' } = req.body || {};
-  for (const p of db.profiles) if (ids.includes(p.id)) p.group = group;
+  if (!Array.isArray(ids)) return fail(res, '环境 ID 必须为数组');
+  if (!db.groups.some((entry) => entry.id === group)) return fail(res, '分组不存在', 404);
+  const selected = new Set(ids);
+  for (const p of db.profiles) if (selected.has(p.id)) p.group = group;
   save();
   ok(res);
 });
@@ -413,25 +489,32 @@ app.get('/api/export', (_req, res) => {
 app.post('/api/import', (req, res) => {
   const data = req.body || {};
   if (!Array.isArray(data.profiles)) return fail(res, '备份文件格式不对');
-  for (const g of data.groups || []) {
-    if (!db.groups.find((x) => x.id === g.id)) db.groups.push(g);
-  }
-  for (const px of data.proxies || []) {
-    if (!db.proxies.find((x) => x.id === px.id)) db.proxies.push(px);
-  }
-  let added = 0;
-  for (const p of data.profiles) {
-    if (db.profiles.find((x) => x.id === p.id)) {
-      // ID 撞了就换一个，不覆盖现有环境
-      const fresh = { ...p, id: newId('env'), name: `${p.name}-导入` };
-      db.profiles.push(fresh);
-    } else {
-      db.profiles.push(p);
+  const entries = { groups: data.groups ?? [], proxies: data.proxies ?? [], profiles: data.profiles };
+  for (const [key, records] of Object.entries(entries)) {
+    if (!Array.isArray(records) || records.some((entry) => !entry || !isProfileId(entry.id))) {
+      return fail(res, `备份中的 ${key} 记录或 ID 格式无效`);
     }
-    added += 1;
   }
-  save();
-  ok(res, { added });
+  if (entries.profiles.some((p) => typeof p.name !== 'string'
+    || !p.fingerprint || typeof p.fingerprint !== 'object' || Array.isArray(p.fingerprint))) {
+    return fail(res, '环境记录缺少名称或指纹配置');
+  }
+
+  const groups = new Map(db.groups.map((g) => [g.id, g]));
+  const proxies = new Map(db.proxies.map((p) => [p.id, p]));
+  const profiles = new Map(db.profiles.map((p) => [p.id, p]));
+  for (const g of entries.groups) if (!groups.has(g.id)) groups.set(g.id, g);
+  for (const px of entries.proxies) if (!proxies.has(px.id)) proxies.set(px.id, px);
+  for (const p of entries.profiles) {
+    const profile = profiles.has(p.id) || deleting.has(p.id)
+      ? { ...p, id: newId('env'), name: `${p.name}-导入` }
+      : p;
+    profiles.set(profile.id, profile);
+  }
+  const updated = { groups: [...groups.values()], proxies: [...proxies.values()], profiles: [...profiles.values()] };
+  save({ ...db, ...updated });
+  Object.assign(db, updated);
+  ok(res, { added: entries.profiles.length });
 });
 
 // ---------------------------------------------------------------- 自动化本地接口
@@ -439,6 +522,10 @@ app.post('/api/import', (req, res) => {
 
 /** 自动化接口统一支持用环境 ID 或名字定位 */
 const findProfile = (idOrName) => db.profiles.find((x) => x.id === idOrName || x.name === idOrName) || null;
+
+app.head(['/api/v1/browser/start', '/api/v1/browser/stop'], (_req, res) => {
+  res.set('Allow', 'GET').sendStatus(405);
+});
 
 app.get('/api/v1/browser/start', async (req, res) => {
   const p = findProfile(req.query.profile_id || req.query.user_id);
@@ -448,7 +535,7 @@ app.get('/api/v1/browser/start', async (req, res) => {
       const rt = runtimeInfo(p.id);
       return res.json({ code: 0, msg: 'already running', data: cdpPayload(rt.cdpPort) });
     }
-    const info = await launchProfile({ ...p, proxy: resolveProxy(p), automation: true }, { force: req.query.force === '1' });
+    const info = await launchConfiguredProfile({ ...p, automation: true }, { force: req.query.force === '1' });
     res.json({ code: 0, msg: 'success', data: { ...cdpPayload(info.cdpPort), ip: info.ipInfo?.ip || '' } });
   } catch (err) {
     res.json({ code: -1, msg: err.message });
@@ -488,13 +575,19 @@ function cdpPayload(port) {
 
 // ----------------------------------------------------------------
 
-app.use((err, _req, res, _next) => fail(res, err, 500));
+app.use((err, _req, res, _next) => {
+  if (err.status === 400) return fail(res, '请求 JSON 格式无效');
+  if (err.status === 413) return fail(res, '请求内容太大', 413);
+  console.error(err);
+  fail(res, '管理端处理请求失败', 500);
+});
 
 const PORT = Number(process.env.PORT) || db.settings.port || 3131;
 
-const server = app.listen(PORT, '127.0.0.1', async () => {
+const adopted = await adoptOrphans();
+ready = true;
+const server = app.listen(PORT, '127.0.0.1', () => {
   const engines = listEngines().filter((e) => e.installed);
-  const adopted = await adoptOrphans();
   console.log('');
   console.log('  指纹浏览器管理端已启动');
   console.log(`  →  http://127.0.0.1:${PORT}`);
@@ -508,6 +601,7 @@ const server = app.listen(PORT, '127.0.0.1', async () => {
 });
 
 async function shutdown() {
+  ready = false;
   console.log('\n正在关闭所有环境…');
   // 中继一断浏览器就没网了，与其让它裸奔不如一起关掉
   await closeAll().catch(() => {});

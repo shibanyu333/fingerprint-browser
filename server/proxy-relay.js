@@ -80,7 +80,7 @@ function httpProxyConnect(up, target) {
   return new Promise((resolve, reject) => {
     const opts = { host: up.host, port: up.port };
     const sock = up.type === 'https'
-      ? tls.connect({ ...opts, servername: up.host, rejectUnauthorized: false })
+      ? tls.connect({ ...opts, servername: net.isIP(up.host) ? undefined : up.host })
       : net.connect(opts);
 
     let settled = false;

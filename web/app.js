@@ -52,7 +52,11 @@ async function api(path, opts = {}) {
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
   const data = await res.json().catch(() => ({ ok: false, error: '服务端返回了非 JSON' }));
-  if (!data.ok && data.error) throw new Error(data.error);
+  if (!res.ok || !data.ok) {
+    const error = new Error(data.error || `请求失败 (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -62,6 +66,8 @@ async function refresh() {
     profiles: data.profiles, groups: data.groups, proxies: data.proxies,
     settings: data.settings, engines: data.engines,
   });
+  const profileIds = new Set(data.profiles.map((p) => p.id));
+  for (const id of state.selected) if (!profileIds.has(id)) state.selected.delete(id);
   if (!state.options) state.options = (await api('/options'));
   render();
 }
@@ -79,7 +85,7 @@ function render() {
 }
 
 function renderSidebar() {
-  const counts = {};
+  const counts = Object.create(null);
   for (const p of state.profiles) counts[p.group] = (counts[p.group] || 0) + 1;
 
   const items = [{ id: 'all', name: '全部环境' }, ...state.groups];
@@ -134,7 +140,7 @@ function renderProfiles() {
     ${list.length ? `
     <div class="table-wrap"><table>
       <thead><tr>
-        <th style="width:34px"><input type="checkbox" id="check-all" ${sel.size && sel.size === list.length ? 'checked' : ''}></th>
+        <th style="width:34px"><input type="checkbox" id="check-all" aria-label="选择当前列表中的所有环境" ${list.every((p) => sel.has(p.id)) ? 'checked' : ''}></th>
         <th>环境</th><th>代理 / 出口 IP</th><th>指纹</th><th>状态</th><th style="text-align:right">操作</th>
       </tr></thead>
       <tbody>${list.map(rowHtml).join('')}</tbody>
@@ -145,7 +151,7 @@ function renderProfiles() {
       ${state.search ? '' : '<button class="btn primary" id="btn-empty-new">创建第一个环境</button>'}
     </div>`}`;
 
-  bindProfileEvents();
+  bindProfileEvents(list);
 }
 
 function rowHtml(p) {
@@ -159,7 +165,7 @@ function rowHtml(p) {
     const tzConflict = ip.crossCheck?.conflict;
     const flags = [risky ? '机房IP' : '', tzConflict ? '时区库有分歧' : ''].filter(Boolean).join(' · ');
     ipHtml = `<span class="pill ${risky || tzConflict ? 'warn' : 'on'}">${esc(ip.ip)}</span>
-      <div class="sub">${esc(ip.countryCode || '')} ${esc(ip.city || '')} · ${ip.latency}ms${flags ? ` · ${esc(flags)}` : ''}</div>`;
+      <div class="sub">${esc(ip.countryCode || '')} ${esc(ip.city || '')} · ${esc(ip.latency)}ms${flags ? ` · ${esc(flags)}` : ''}</div>`;
   }
 
   return `<tr data-id="${esc(p.id)}">
@@ -176,7 +182,7 @@ function rowHtml(p) {
     </td>
     <td>
       <span class="pill">${esc(platLabel)} · ${esc(fp.brand)}</span>
-      <div class="sub">${esc(fp.timezone)} · ${esc(fp.lang)} · 种子 ${fp.seed}</div>
+      <div class="sub">${esc(fp.timezone)} · ${esc(fp.lang)} · 种子 ${esc(fp.seed)}</div>
     </td>
     <td>
       ${p.running
@@ -194,7 +200,7 @@ function rowHtml(p) {
   </tr>`;
 }
 
-function bindProfileEvents() {
+function bindProfileEvents(list) {
   const search = $('#search');
   if (search) {
     search.oninput = (e) => {
@@ -209,15 +215,20 @@ function bindProfileEvents() {
 
   const checkAll = $('#check-all');
   if (checkAll) {
+    checkAll.indeterminate = !checkAll.checked && list.some((p) => state.selected.has(p.id));
     checkAll.onchange = (e) => {
-      state.selected = e.target.checked ? new Set(filteredProfiles().map((p) => p.id)) : new Set();
+      for (const { id } of list) {
+        if (e.target.checked) state.selected.add(id);
+        else state.selected.delete(id);
+      }
       renderProfiles();
     };
   }
 
-  document.querySelectorAll('tbody tr').forEach((tr) => {
+  const profilesById = new Map(list.map((p) => [p.id, p]));
+  $('#content').querySelectorAll('tbody tr').forEach((tr) => {
     const id = tr.dataset.id;
-    const p = state.profiles.find((x) => x.id === id);
+    const p = profilesById.get(id);
     tr.querySelector('.row-check').onchange = (e) => {
       if (e.target.checked) state.selected.add(id);
       else state.selected.delete(id);
@@ -323,7 +334,7 @@ function moreMenu(p, btn) {
       };
       root.querySelector('[data-x=purge]').onclick = () => {
         if (!confirm(`彻底删除「${p.name}」？\n\n该环境的 Cookie、登录状态、缓存会一并抹掉，无法恢复。`)) return;
-        act(() => fetch(`/api/profiles/${p.id}?purge=1`, { method: 'DELETE' }).then((r) => r.json()), '已彻底删除');
+        act(() => api(`/profiles/${p.id}?purge=1`, { method: 'DELETE' }), '已彻底删除');
       };
     },
   });
@@ -411,7 +422,7 @@ function profileModal(p) {
         <div class="row">
           <div class="field"><label>指纹种子</label>
             <div style="display:flex;gap:8px">
-              <input class="input" data-f="fingerprint.seed" value="${fp.seed || ''}" placeholder="留空自动生成">
+              <input class="input" data-f="fingerprint.seed" value="${esc(fp.seed || '')}" placeholder="留空自动生成">
               <button class="btn" data-x="reroll">换一个</button>
             </div>
           </div>
@@ -444,7 +455,7 @@ function profileModal(p) {
           <div class="field"><label>时区</label><select class="input" data-f="fingerprint.timezone">
             ${opt.timezones.map((t) => `<option ${fp.timezone === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}
           </select></div>
-          <div class="field"><label>CPU 核心数</label><input class="input" data-f="fingerprint.hardwareConcurrency" value="${fp.hardwareConcurrency || ''}" placeholder="按种子随机"></div>
+          <div class="field"><label>CPU 核心数</label><input class="input" data-f="fingerprint.hardwareConcurrency" value="${esc(fp.hardwareConcurrency || '')}" placeholder="按种子随机"></div>
           <div class="field"><label>WebRTC</label><select class="input" data-f="fingerprint.webrtc">
             <option value="disabled" ${fp.webrtc === 'disabled' ? 'selected' : ''}>禁止非代理 UDP（防 IP 泄露）</option>
             <option value="default" ${fp.webrtc === 'default' ? 'selected' : ''}>保持默认（不推荐）</option>
@@ -474,8 +485,8 @@ function profileModal(p) {
       <div class="field"><label class="check"><input type="checkbox" data-f="automation" ${draft.automation ? 'checked' : ''}>
         开启自动化端口（Playwright / Puppeteer 可接管）</label></div>
       <div class="row">
-        <div class="field"><label>窗口宽</label><input class="input" data-f="window.width" value="${draft.window?.width || ''}" placeholder="跟随全局设置"></div>
-        <div class="field"><label>窗口高</label><input class="input" data-f="window.height" value="${draft.window?.height || ''}" placeholder="跟随全局设置"></div>
+        <div class="field"><label>窗口宽</label><input class="input" data-f="window.width" value="${esc(draft.window?.width || '')}" placeholder="跟随全局设置"></div>
+        <div class="field"><label>窗口高</label><input class="input" data-f="window.height" value="${esc(draft.window?.height || '')}" placeholder="跟随全局设置"></div>
       </div>
       <div class="field"><label>关闭部分指纹伪装（排查网站显示异常时用）</label>
         <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:6px">
@@ -633,6 +644,12 @@ function batchCreateModal() {
 // ================================================================ 代理池
 
 function renderProxies() {
+  const usage = new Map();
+  for (const p of state.profiles) {
+    if (p.proxy?.mode !== 'pool') continue;
+    const id = p.proxy.poolId;
+    usage.set(id, (usage.get(id) || 0) + 1);
+  }
   $('#topbar').innerHTML = `
     <h2>代理池</h2>
     <div class="spacer"></div>
@@ -649,14 +666,14 @@ function renderProxies() {
     <div class="table-wrap"><table>
       <thead><tr><th>代理</th><th>类型</th><th>认证</th><th>最近检测</th><th>绑定环境</th><th style="text-align:right">操作</th></tr></thead>
       <tbody>${state.proxies.map((x) => {
-    const used = state.profiles.filter((p) => p.proxy?.mode === 'pool' && p.proxy.poolId === x.id);
+    const used = usage.get(x.id);
     const c = x.lastCheck;
     return `<tr data-id="${esc(x.id)}">
-          <td><b>${esc(x.label)}</b><div class="sub mono">${esc(x.host)}:${x.port}</div></td>
+          <td><b>${esc(x.label)}</b><div class="sub mono">${esc(x.host)}:${esc(x.port)}</div></td>
           <td><span class="pill">${esc(x.type)}</span></td>
           <td class="sub">${x.username ? `${esc(x.username)} / ••••••` : '无需认证'}</td>
-          <td>${c ? `<span class="pill ${c.ok ? 'on' : 'bad'}">${esc(c.ip || '失败')}</span><div class="sub">${esc(c.countryCode || '')} ${esc(c.city || '')} ${c.latency ? `· ${c.latency}ms` : ''}</div>` : '<span class="sub">未检测</span>'}</td>
-          <td class="sub">${used.length ? `${used.length} 个` : '—'}</td>
+          <td>${c ? `<span class="pill ${c.ok ? 'on' : 'bad'}">${esc(c.ip || '失败')}</span><div class="sub">${esc(c.countryCode || '')} ${esc(c.city || '')} ${c.latency ? `· ${esc(c.latency)}ms` : ''}</div>` : '<span class="sub">未检测</span>'}</td>
+          <td class="sub">${used ? `${used} 个` : '—'}</td>
           <td class="actions">
             <button class="btn sm" data-px="check">检测</button>
             <button class="btn sm ghost" data-px="edit">编辑</button>
@@ -687,9 +704,15 @@ function renderProxies() {
             toast('已删除');
             refresh();
           } catch (err) {
-            if (confirm(`${err.message}\n\n仍然删除吗？这些环境会变成"无代理"。`)) {
-              await fetch(`/api/proxies/${px.id}?force=1`, { method: 'DELETE' });
-              refresh();
+            if (err.status === 409 && confirm(`${err.message}\n\n仍然删除吗？这些环境需要重新配置代理才能启动。`)) {
+              try {
+                await api(`/proxies/${px.id}?force=1`, { method: 'DELETE' });
+                refresh();
+              } catch (err) {
+                toast(err.message, 'err');
+              }
+            } else if (err.status !== 409) {
+              toast(err.message, 'err');
             }
           }
           return;
@@ -860,14 +883,14 @@ function renderSettings() {
   $('#content').innerHTML = `
     <h3 style="font-size:14px;margin:0 0 12px">批量打开时的窗口排布</h3>
     <div class="row" style="max-width:620px">
-      <div class="field"><label>每行几个窗口</label><input class="input" id="s-cols" value="${g.cols}"></div>
-      <div class="field"><label>窗口宽</label><input class="input" id="s-w" value="${g.width}"></div>
-      <div class="field"><label>窗口高</label><input class="input" id="s-h" value="${g.height}"></div>
+      <div class="field"><label>每行几个窗口</label><input class="input" id="s-cols" value="${esc(g.cols)}"></div>
+      <div class="field"><label>窗口宽</label><input class="input" id="s-w" value="${esc(g.width)}"></div>
+      <div class="field"><label>窗口高</label><input class="input" id="s-h" value="${esc(g.height)}"></div>
     </div>
     <div class="row" style="max-width:620px">
-      <div class="field"><label>横向间距</label><input class="input" id="s-gx" value="${g.gapX}"></div>
-      <div class="field"><label>纵向间距</label><input class="input" id="s-gy" value="${g.gapY}"></div>
-      <div class="field"><label>顶部留白</label><input class="input" id="s-oy" value="${g.originY}"></div>
+      <div class="field"><label>横向间距</label><input class="input" id="s-gx" value="${esc(g.gapX)}"></div>
+      <div class="field"><label>纵向间距</label><input class="input" id="s-gy" value="${esc(g.gapY)}"></div>
+      <div class="field"><label>顶部留白</label><input class="input" id="s-oy" value="${esc(g.originY)}"></div>
     </div>
     <button class="btn primary" id="s-save">保存设置</button>
 
@@ -884,7 +907,7 @@ function renderSettings() {
     <h3 style="font-size:14px;margin:30px 0 12px">给自动化脚本用的本地接口</h3>
     <div class="callout">
       环境开启「自动化端口」后，用下面的接口拿 CDP 地址，Playwright / Puppeteer 直接接管：<br>
-      <code>GET http://127.0.0.1:${state.settings.port || 3131}/api/v1/browser/start?profile_id=环境ID</code><br>
+      <code>GET ${esc(location.origin)}/api/v1/browser/start?profile_id=环境ID</code><br>
       <code>GET .../api/v1/browser/stop?profile_id=环境ID</code> ·
       <code>GET .../api/v1/user/list</code>
     </div>`;
@@ -932,11 +955,14 @@ function modal({ title, body, footer, onMount }) {
   </div>`;
   $('#modal-root').appendChild(overlay);
 
-  const close = () => overlay.remove();
+  const close = () => {
+    document.removeEventListener('keydown', onEsc);
+    overlay.remove();
+  };
   overlay.onclick = (e) => { if (e.target === overlay) close(); };
   overlay.querySelectorAll('[data-close]').forEach((b) => { b.onclick = close; });
   const onEsc = (e) => {
-    if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onEsc); }
+    if (e.key === 'Escape') close();
   };
   document.addEventListener('keydown', onEsc);
 
@@ -982,7 +1008,9 @@ $('#add-group').onclick = async () => {
 
 // 有环境在跑的时候定时刷新状态，浏览器被手动关掉了列表也能跟上
 setInterval(() => {
-  if (state.view === 'profiles' && state.profiles.some((p) => p.running) && !$('.overlay')) refresh();
+  if (state.view === 'profiles' && state.profiles.some((p) => p.running) && !$('.overlay') && document.activeElement?.id !== 'search') {
+    refresh().catch((err) => toast(err.message, 'err'));
+  }
 }, 5000);
 
 refresh().catch((err) => {
