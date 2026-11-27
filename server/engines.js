@@ -72,9 +72,14 @@ export function listEngines() {
 
 export function resolveEngine(engineId) {
   const engines = listEngines();
-  const wanted = engines.find((e) => e.id === engineId && e.installed);
-  if (wanted) return wanted;
-  // 没指定或指定的没装：优先挑指纹内核，退而求其次用系统浏览器
+  if (engineId) {
+    const wanted = engines.find((e) => e.id === engineId);
+    if (!wanted?.installed || !wanted.path) {
+      throw new Error(`指定的浏览器内核不可用（${wanted?.name || engineId}），请安装该内核或在环境设置中重新选择`);
+    }
+    return wanted;
+  }
+  // 自动选择时优先挑指纹内核，其次用系统浏览器。
   return engines.find((e) => e.kind === 'fingerprint' && e.installed)
     || engines.find((e) => e.installed)
     || null;

@@ -14,6 +14,7 @@ const DEFAULTS = {
   groups: [{ id: 'default', name: '未分组', createdAt: 0 }],
   proxies: [],
   profiles: [],
+  deletedProfiles: [],
   settings: {
     port: 3131,
     defaultEngine: '',
@@ -23,14 +24,31 @@ const DEFAULTS = {
 
 let db = null;
 
+// Existing installations can have been created with the default umask (0755/0644).
+function restrictToOwner(entry) {
+  const stat = fs.lstatSync(entry);
+  if (stat.isSymbolicLink()) {
+    if (fs.statSync(entry).mode & 0o077) {
+      throw new Error(`请先将符号链接指向的存储路径设为仅所有者可访问：${entry}`);
+    }
+    return;
+  }
+  if (stat.mode & 0o077) fs.chmodSync(entry, stat.mode & 0o700);
+}
+
 function ensureDirs() {
-  for (const d of [DATA_DIR, PROFILE_DIR, BROWSER_DIR]) fs.mkdirSync(d, { recursive: true });
+  for (const dir of [DATA_DIR, PROFILE_DIR]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    restrictToOwner(dir);
+  }
+  fs.mkdirSync(BROWSER_DIR, { recursive: true });
 }
 
 export function load() {
-  ensureDirs();
   if (db) return db;
+  ensureDirs();
   if (fs.existsSync(DB_FILE)) {
+    restrictToOwner(DB_FILE);
     try {
       db = { ...structuredClone(DEFAULTS), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
       db.settings = { ...DEFAULTS.settings, ...db.settings };

@@ -1,7 +1,6 @@
 # 指纹浏览器 · 多账号防关联环境管理
 
-自用的 AdsPower 替代品。给电商多店铺运营用：每个店铺一个独立环境，各自的 Cookie、
-指纹、代理 IP 完全隔离，互相之间查不出关联。
+用于单机管理多个浏览器环境。每个环境使用独立的 Chromium 用户数据目录，并可单独设置内核、代理和指纹参数。
 
 内核用的是 [fingerprint-chromium](https://github.com/adryfish/fingerprint-chromium)（BSD-3 协议），
 在 C++ 源码层改写指纹；管理端、代理认证中继、批量操作是本项目自己写的。详见 `REUSED.md`。
@@ -24,13 +23,32 @@ cd ~/指纹 && npm start        # 终端里运行，日志直接打在屏幕上
 或者双击 `启动.command`（会开一个终端窗口）。服务跑起来后，浏览器访问
 **http://127.0.0.1:3131** 也能进同一个界面。
 
-> 服务只监听 `127.0.0.1`，别人访问不到。
+> 服务只监听 `127.0.0.1`，同一台电脑上的其他本机客户端也能调用管理 API。
 > App 需要本机装有 Node.js 20 以上；找不到时会弹窗提示。
+
+## 命令行（CLI）
+
+桌面界面和 CLI 共用同一个本机管理端。先打开桌面 App 或运行 `npm start`。在项目目录的终端里运行：
+
+```bash
+npm run --silent cli -- health
+npm run --silent cli -- list
+```
+
+AI 客户端可运行 `npm run --silent cli -- --help --json` 读取命令及参数。查询回收站用 `trash --json`，恢复指定环境用 `restore <ID> --json`。
+
+把下面的 `env_xxx` 换成列表里的环境 ID。打开环境时会使用桌面界面里保存的配置。
+
+```bash
+npm run --silent cli -- start env_xxx
+npm run --silent cli -- stop env_xxx
+```
+
+如需在任意目录使用短命令，在项目目录执行一次 `npm link`，之后就可以直接运行 `fingerprint-browser list`。用 `--help` 查看命令，`--json` 获取成功响应的原始 JSON。命令失败时错误写入标准错误，退出码为 1。管理端使用自定义端口时，可传 `--port 端口号` 或设置 `PORT` 环境变量。
 
 ## 第一次用，按这个顺序走
 
-**1. 确认内核** —— 左侧「浏览器内核」，`Fingerprint Chromium 148` 应该显示"可用"。
-   （已经装好了。要换版本可以在这页下载别的。）
+**1. 确认内核** —— 在左侧「浏览器内核」查看当前机器已安装的版本。系统 Chrome 和可下载的 Fingerprint Chromium 支持的指纹设置有差异。
 
 **2. 加代理** —— 左侧「代理池」→「批量导入」，一行一条，下面几种写法都认：
 
@@ -50,22 +68,10 @@ socks5://用户名:密码@1.2.3.4:1080
 ## 几个要理解的概念
 
 ### 指纹种子
-一个 32 位整数，等于「一台虚拟电脑」。同一个种子每次开出来的 canvas、WebGL、音频、
-字体指纹完全一致；换个种子就是另一台机器。
-
-**不同环境必须用不同种子** —— 平台正是靠这个判定"这两个号是同一个人"。批量创建和克隆
-都会自动分配新种子，不用手动管。
-
-实测同样配置的两个环境，WebGL 一个报 Intel UHD Graphics、一个报 NVIDIA RTX 4060，
-canvas 哈希也完全不同。
+指纹种子随环境保存。支持该参数的内核会用种子生成部分浏览器属性，批量创建和克隆环境时会分配新种子。网页最终能读取哪些属性，还取决于实际启动的内核、版本和硬件。
 
 ### 代理
-防关联最重要的一环。**一个店铺固定一个 IP**，别几个店共用出口。
-优先住宅 IP / 静态 ISP，机房 IP 在电商平台上风控更严（检测结果里会标注"机房IP"）。
-
-带账号密码的 SOCKS5 是支持的 —— Chromium 原生不支持代理认证，本项目为每个环境起了一个
-本地中继来完成认证，浏览器只连 `127.0.0.1`。DNS 也在代理出口解析，不会泄露。
-使用 HTTPS 代理时，证书需要通过 Node.js 的信任链和主机名校验。
+环境可以直连、引用代理池，或保存单独的代理设置。配置代理后，管理端通过本机中继连接上游。可用性检查会向 ip-api.com（HTTP）和 ipwho.is（HTTPS）查询出口位置，两家服务会收到查询流量的出口 IP。使用 HTTPS 上游代理时会验证证书和主机名。
 
 ### 自动校正语言时区
 默认开着。打开环境时会先查代理出口 IP 的真实位置，把浏览器语言和时区改成对应值。
@@ -84,103 +90,72 @@ canvas 哈希也完全不同。
 | 复制一个环境 | 「⋯」→「克隆环境」（会自动换新指纹） |
 | 觉得某个号指纹脏了 | 「⋯」→「重新随机指纹」 |
 | 彻底重来 | 「⋯」→「删除环境并清空 Cookie 数据」 |
+| 找回误删环境 | 「设置与备份」→「环境回收站」→「恢复」，会沿用原 ID 和数据目录 |
 | 分组管理 | 左侧「分组」旁的 `+`；勾选环境后用「移动到分组…」 |
 | 改窗口排布 | 「设置与备份」里调每行几个、窗口大小 |
 
 ## 换电脑 / 备份
 
-- **只搬配置**（环境、指纹、代理，含密码）：「设置与备份」→「导出配置」，新机器上导入。
-- **连登录状态一起搬**：直接把整个 `指纹` 文件夹拷过去。
+从本版起，「移入回收站」会在本机保留环境配置和原数据目录，重启管理端后仍可恢复。如果原分组已删除，恢复的环境归入「未分组」。回收站中的环境不随配置导出，需要迁移时先恢复。要永久清理回收站中的环境，先恢复，再到环境菜单执行「删除环境并清空 Cookie 数据」。升级前已删除的环境需要从已有备份恢复配置。
+
+- **只搬配置**：在「设置与备份」点击「导出加密备份」，设置至少 12 个字符的密码。在新机器点击「导入备份」并输入密码。请另外保管密码，遗失后无法解密。原有明文 JSON 也可以导入。
+- **明文导出**：需要与旧版工具交换数据时可选「导出明文 JSON」。这份文件包含代理密码，任何拿到文件的人都能读取。
+- **连登录状态一起搬**：先关闭环境和管理端，再把整个 `指纹` 文件夹拷过去。
   Cookie 和登录态在 `profiles/` 目录里，一个环境一个子目录。
   整个项目不依赖绝对路径，文件夹放哪都能跑，挪完照样双击 `启动.command`。
 
 `data/db.json` 是所有配置，`profiles/` 是浏览器数据。**这两个是你的全部资产，记得备份。**
 
-## 给自动化脚本用
+## 让 AI 操作已打开的环境
 
-Agent 可以从同一台电脑的终端直接用 `curl` 调用本机 HTTP API。先用 `npm start` 或桌面 App 启动管理端，再查询服务与环境列表。
+在目标环境的「编辑 → 高级」勾选「开启自动化端口」并保存。环境已经打开时，关闭并重新打开一次。取得 CDP 地址的工具可以读取该环境已登录的页面，并以当前网站账号执行操作。
 
-```bash
-curl -fsS http://127.0.0.1:3131/api/health
-curl -fsS http://127.0.0.1:3131/api/v1/user/list
-```
-
-`/api/health` 在管理端就绪后返回 `{"ok":true,"service":"fingerprint-browser"}`。
-环境列表的 `data.list[].user_id` 是后续查询环境时使用的 ID。优先使用这个列表接口读取环境概要，`/api/state` 会返回管理界面所需的完整配置，包括代理认证信息。
-
-环境编辑页的「高级」标签里勾上「开启自动化端口」，然后：
+在项目目录运行以下命令。把 `env_xxx` 换成环境 ID。
 
 ```bash
-# 启动并拿到 CDP 地址
-curl "http://127.0.0.1:3131/api/v1/browser/start?profile_id=env_xxx"
-# → {"code":0,"data":{"debug_port":"55744","ws":{"puppeteer":"http://127.0.0.1:55744"}}}
-
-curl "http://127.0.0.1:3131/api/v1/browser/stop?profile_id=env_xxx"
-curl "http://127.0.0.1:3131/api/v1/user/list"
+npm run --silent cli -- list --json
+npm run --silent cli -- start env_xxx --json
+npm run --silent cli -- connect env_xxx --json
 ```
 
-Playwright 接管：
+1. 列表里的 `user_id`、`name`、`automation` 和 `running` 可用于定位目标。已运行的环境直接执行 `connect`。
+2. `connect` 会检查环境设置、运行状态和调试端口是否就绪，返回形如 `{"ok":true,"profileId":"env_xxx","cdpPort":55744,"cdpUrl":"http://127.0.0.1:55744"}` 的 JSON。每次打开环境后重新获取地址，也可以从该环境的「⋯」菜单复制连接命令。
+3. 把 `cdpUrl` 交给支持 CDP 的本机工具。使用 Playwright 时，调用 `chromium.connectOverCDP(cdpUrl)`，在已存在的页面中按网址选中目标标签页，即可读取页面、点击按钮或填写表单。操作完断开客户端即可保留窗口，确实要关闭环境时再用 `stop`。
 
-```js
-import { chromium } from 'playwright';
+使用 `--json` 时，失败信息以 JSON 写入标准错误并返回退出码 1。`connect` 的 HTTP 状态码区分未开启自动化（403）、环境不存在（404）、环境未运行或需重开（409）、端口尚未就绪（503）。
 
-const r = await (await fetch('http://127.0.0.1:3131/api/v1/browser/start?profile_id=env_xxx')).json();
-const browser = await chromium.connectOverCDP(r.data.ws.puppeteer);
-const page = browser.contexts()[0].pages()[0];
-await page.goto('https://sellercentral.amazon.com');
-```
+### 接入开源浏览器客户端
 
-## 实测跑分结果
+已有以下客户端时，可用它读取目标标签页的可访问性快照。将示例中的环境 ID 和端口换成本次 `connect` 返回的值。会话名称使用环境 ID，便于同时区分不同浏览器。
 
-在真实检测站上跑过（macOS + 美国出口 IP + 伪装成 Windows）：
-
-| 检测站 | 结果 |
+| 客户端 | 连接并查看页面 |
 |---|---|
-| **BrowserScan** | **真实度 100%**，Bot Detection: No，Proxy: No |
-| **CreepJS** | `0% headless`、`0% stealth`，WebRTC host/stun 全 blocked |
-| **Pixelscan** | 代理未识别 ✅、无自动化行为 ✅、地理一致 ✅、**但 Fingerprint 一项报 "Masking detected"** |
-| **两环境对比** | canvas / WebGL / 字体哈希完全不同，无法据此关联 ✅ |
+| [Microsoft Playwright CLI](https://github.com/microsoft/playwright-cli) | `playwright-cli -s=env_xxx attach --cdp=http://127.0.0.1:55744`。同一命名会话内依次使用 `tab-list`、`tab-select <序号>`、`snapshot`。用完运行 `playwright-cli -s=env_xxx detach`。 |
+| [Vercel agent-browser](https://agent-browser.dev/cdp-mode) | `agent-browser --session env_xxx --cdp 55744 tab list`。同一命名会话内用 `tab <标签页ID>` 选择目标，再用 `snapshot -i` 列出可交互元素及其引用。 |
 
-BrowserScan 一开始只有 80 分，扣分来自两处，都已修掉（详见 `REUSED.md`）：
-Intl 泄露系统中文语言、以及 IP 时区不匹配。
+多个标签页并存时先核对目标页面的标题和地址。页面跳转或重新渲染后重新取快照，再使用新快照里的元素引用。
 
-### 关于 Pixelscan 的 "Masking detected"
+### 本机 HTTP 接口
 
-Pixelscan 会检测出指纹被修改过。这个基本无解，也**不代表工具没用**：
+同一台电脑上的客户端也可以调用 `GET /api/health`、`GET /api/v1/user/list`、`GET /api/profiles/<ID>/connection`。已有脚本使用的 `/api/v1/browser/start`、`stop` 和 `active` 接口继续可用。其中旧版 `start` 接口会主动请求以自动化模式启动。完整的 `/api/state` 可能包含代理认证信息，列出环境时使用概要接口即可。
 
-canvas / WebGL 噪声正是让两个环境无法互相关联的东西 —— 关掉它，Pixelscan 立刻满意，
-但你所有环境会共用同一个 canvas 哈希，平台一比对就知道是同一个人。**二者不可兼得。**
+## 隐私边界
 
-对电商防关联来说，重要的是「A 店和 B 店看起来不是同一台电脑」，而不是
-「看起来完全没用工具」。Amazon、eBay 不会跑 Pixelscan，它们做的是跨账号指纹比对。
-顺带一提，Pixelscan 页面上「Masking detected」旁边就挂着指纹浏览器的推广广告 ——
-它的商业模式本身就是检测这类工具。
+- **网站存储隔离**。Cookie、Local Storage 和浏览历史保存在各自的环境目录。关闭环境后数据会保留，以便下次继续使用。自定义启动参数不能覆盖管理端分配的用户数据、浏览器配置或磁盘缓存目录。
+- **网站仍可读取浏览器特征**。历史记录里，两个环境曾呈现不同的 canvas 和 WebGL 结果，Pixelscan 也曾报告指纹修改。这些观察仅适用于当时的样本和内核。站点还可以结合登录账号、网络、行为等信号识别用户。
+- **设置应用失败**。浏览器进程已启动但运行时设置加载失败时，列表会显示「部分浏览器设置未能应用」。这条提示报告加载错误；具体网站可以读取哪些值仍需在实际内核中验证。
+- **本机访问权限**。管理端启动时会收紧配置文件和存储目录的文件权限。运行期间，本机管理 API 没有客户端身份验证，其他可访问回环端口的进程仍能读取完整状态和明文配置导出，其中可能包含代理密码。备份密码保护的是导出的加密文件。
+- **恢复范围**。配置导入可恢复环境定义。迁移 Cookie 等浏览器数据时应先关闭环境，再备份 `profiles/`。恢复后能否继续登录，还取决于站点的会话有效期和浏览器的数据保护机制。
 
-如果某个特定平台确实对某项噪声敏感，可以在「高级」标签里单独关掉那一项（比如只关 canvas），
-但关得越多越容易被关联。**唯独字体伪装别关** —— 关掉后浏览器会枚举 macOS 上几百个中日韩字体，
-既暴露真实系统，还会让一些站的字体探测卡死（实测 Pixelscan 就会卡在 "Collecting Data"）。
+### 与 AdsPower 的对照（2026-11-27）
 
-自己验证：开两个环境分别访问 https://browserscan.net 和
-https://abrahamjuliot.github.io/creepjs/ ，对比指纹哈希应该完全不同。
+| 项目 | 本项目验证结果 | AdsPower 官方说明 |
+|---|---|---|
+| 环境隔离 | 两个临时系统 Chrome 环境访问同一测试站，Cookie 与 Local Storage 分开，原环境重启后仍可读回。 | [环境独立保存浏览数据](https://help.adspower.com/docs/creating_browser_profiles) |
+| 数据恢复 | 可手动导出加密配置，本地浏览器数据需单独备份。当前没有按环境回退到历史版本的入口。 | [SunBrowser 可选保留最近五份本地缓存快照](https://help.adspower.com/docs/Cache-Data) |
+| 多人管理 | 分组用于查找和批量操作，当前没有成员授权。 | [成员分组和功能权限](https://help.adspower.com/docs/members) |
 
-## 说清楚局限
-
-**这个工具能做的**：让每个环境在指纹层面像一台独立电脑，配合独立 IP 做到互不关联。
-
-**做不到的**：
-
-- **`screen.colorDepth` 报 30**（macOS 广色域特征，Windows 通常 24）。没有参数能改，
-  用 JS 补丁改反而会引入新破绽。开了 HDR 的 Windows 也报 30，属于少见但不是不可能。
-- **不能对抗行为分析**。鼠标轨迹、打字节奏、操作习惯是另一个维度，工具管不了。
-  同一个人操作 20 个号，行为模式本身就是关联特征。
-- **不是万能的**。平台风控还看注册信息、收款账户、发货地址、商品重合度、登录时间规律。
-  指纹和 IP 只是其中两项。
-
-> 屏幕分辨率原本也改不了（会暴露 Mac 的 1470×956），现在已经通过浏览器原生接口解决，
-> 在「指纹」标签里可选常见的 Windows 分辨率。
-
-**养号的常识**：新环境别一上来就登录高价值账号；一个环境固定一个 IP 别乱换；
-不同店铺的操作时间错开；别在同一环境里登多个平台的号。
+本次核对使用本地源码、临时系统 Chrome 环境及 AdsPower 公开文档。两款产品在相同内核、设备和测试页面下的指纹表现仍待实测。
 
 ## 项目结构
 
@@ -196,7 +171,8 @@ server/
   engines.js       内核下载安装
   cdp-stealth.js   系统 Chrome 的降级补丁层
 web/               管理界面（原生 JS，无构建步骤）
-browsers/          浏览器内核（369MB，别删）
+bin/               命令行入口
+browsers/          下载的浏览器内核（大小随版本变化）
 profiles/          各环境的 Cookie / 登录态 ★ 记得备份
 data/db.json       全部配置 ★ 记得备份
 ```

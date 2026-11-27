@@ -5,7 +5,9 @@
   "type": "module",
   "description": "自用指纹浏览器 / 多账号防关联环境管理器",
   "scripts": {
-    "start": "node server/index.js"
+    "test": "node --test",
+    "start": "node server/index.js",
+    "cli": "node bin/fingerprint-browser.js"
   },
   "engines": {
     "node": ">=20"
@@ -14,5 +16,8 @@
     "express": "^4.22.3",
     "socks": "^2.8.4",
     "ws": "^8.18.0"
+  },
+  "bin": {
+    "fingerprint-browser": "bin/fingerprint-browser.js"
   }
 }

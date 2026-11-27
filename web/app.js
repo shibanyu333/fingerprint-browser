@@ -60,16 +60,29 @@ async function api(path, opts = {}) {
   return data;
 }
 
-async function refresh() {
+let refreshVersion = 0;
+async function refresh({ background = false } = {}) {
+  const version = ++refreshVersion;
   const data = await api('/state');
+  const options = state.options || await api('/options');
+  if (version !== refreshVersion || (background && !canSyncProfiles())) return;
+  const focus = document.activeElement;
+  let focusSelector;
+  if (background && focus?.matches('button')) {
+    if (focus.id) focusSelector = '#' + CSS.escape(focus.id);
+    else if (focus.dataset.act) {
+      const rowId = focus.closest('tr')?.dataset.id;
+      if (rowId) focusSelector = `tr[data-id="${CSS.escape(rowId)}"] [data-act="${CSS.escape(focus.dataset.act)}"]`;
+    }
+  }
   Object.assign(state, {
     profiles: data.profiles, groups: data.groups, proxies: data.proxies,
-    settings: data.settings, engines: data.engines,
+    settings: data.settings, engines: data.engines, options,
   });
   const profileIds = new Set(data.profiles.map((p) => p.id));
   for (const id of state.selected) if (!profileIds.has(id)) state.selected.delete(id);
-  if (!state.options) state.options = (await api('/options'));
   render();
+  if (focusSelector) $(focusSelector)?.focus({ preventScroll: true });
 }
 
 // ================================================================ 渲染
@@ -117,6 +130,8 @@ function filteredProfiles() {
 function renderProfiles() {
   const list = filteredProfiles();
   const sel = state.selected;
+  const visibleIds = new Set(list.map((profile) => profile.id));
+  for (const id of sel) if (!visibleIds.has(id)) sel.delete(id);
   const runningCount = state.profiles.filter((p) => p.running).length;
 
   $('#topbar').innerHTML = `
@@ -131,7 +146,7 @@ function renderProfiles() {
 
   $('#content').innerHTML = `
     <div class="searchbar">
-      <input class="input" id="search" placeholder="搜索环境名 / 店铺 / 账号 / IP…" value="${esc(state.search)}">
+      <input class="input" id="search" aria-label="搜索环境" placeholder="搜索环境名 / 店铺 / 账号 / IP…" value="${esc(state.search)}">
       ${sel.size ? `<select class="input" id="move-group" style="max-width:180px">
         <option value="">移动到分组…</option>
         ${state.groups.map((g) => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('')}
@@ -147,7 +162,7 @@ function renderProfiles() {
     </table></div>` : `
     <div class="empty">
       <h3>${state.search ? '没有匹配的环境' : '还没有环境'}</h3>
-      <p>每个环境 = 一套独立的 Cookie + 指纹 + 代理 IP，互相之间完全隔离。</p>
+      <p>${state.search ? '试试环境名称、店铺、账号或 IP。' : '为环境命名并选择浏览器配置，Cookie 和登录状态会保存在该环境的目录里。'}</p>
       ${state.search ? '' : '<button class="btn primary" id="btn-empty-new">创建第一个环境</button>'}
     </div>`}`;
 
@@ -169,7 +184,7 @@ function rowHtml(p) {
   }
 
   return `<tr data-id="${esc(p.id)}">
-    <td><input type="checkbox" class="row-check" ${state.selected.has(p.id) ? 'checked' : ''}></td>
+    <td><input type="checkbox" class="row-check" aria-label="选择环境：${esc(p.name)}" ${state.selected.has(p.id) ? 'checked' : ''}></td>
     <td>
       <div class="name-cell">
         <b>${esc(p.name)}</b>
@@ -186,7 +201,8 @@ function rowHtml(p) {
     </td>
     <td>
       ${p.running
-    ? `<span class="pill on"><i class="dot"></i>运行中</span><div class="sub">${p.runtime?.cdpPort ? `CDP :${p.runtime.cdpPort}` : ''}</div>`
+    ? `<span class="pill on"><i class="dot"></i>运行中</span><div class="sub">${p.runtime?.cdpPort ? `CDP :${p.runtime.cdpPort}` : ''}</div>
+       ${p.runtime?.settingsWarning ? `<span class="pill warn">${esc(p.runtime.settingsWarning)}</span>` : ''}`
     : `<span class="pill off"><i class="dot"></i>未运行</span><div class="sub">${ago(p.lastRunAt)}</div>`}
     </td>
     <td class="actions">
@@ -203,14 +219,17 @@ function rowHtml(p) {
 function bindProfileEvents(list) {
   const search = $('#search');
   if (search) {
-    search.oninput = (e) => {
-      state.search = e.target.value;
-      const pos = e.target.selectionStart;
+    const applySearch = () => {
+      if (state.search === search.value) return;
+      state.search = search.value;
+      const pos = search.selectionStart;
       renderProfiles();
       const s = $('#search');
       s.focus();
       s.setSelectionRange(pos, pos);
     };
+    search.oninput = (e) => { if (!e.isComposing) applySearch(); };
+    search.addEventListener('compositionend', applySearch);
   }
 
   const checkAll = $('#check-all');
@@ -261,6 +280,8 @@ function bindProfileEvents(list) {
     refresh();
   });
   on('#btn-close-all', async () => {
+    const count = state.profiles.filter((profile) => profile.running).length;
+    if (!confirm(`关闭所有分组中正在运行的环境？当前共 ${count} 个，包含搜索结果以外的环境。`)) return;
     const r = await api('/batch/close-all', { method: 'POST', body: {} });
     toast(`已关闭 ${r.closed} 个环境`);
     refresh();
@@ -309,19 +330,34 @@ async function batchOpen() {
 }
 
 function moreMenu(p, btn) {
+  const portFlag = location.port && location.port !== '3131' ? ` --port ${location.port}` : '';
+  const connectCommand = `npm run --silent cli -- connect ${p.id}${portFlag} --json`;
   modal({
     title: `${p.name}`,
     body: `
       <div class="callout">环境 ID <code>${esc(p.id)}</code><br>创建于 ${new Date(p.createdAt).toLocaleString('zh-CN')}</div>
+      ${p.automation && p.running ? `<div class="field"><label for="ai-connect">AI 连接命令</label>
+        <input class="input" id="ai-connect" readonly value="${esc(connectCommand)}">
+        <button class="btn" data-x="copy-connect">复制连接命令</button></div>` : ''}
       <div style="display:flex;flex-direction:column;gap:8px">
         <button class="btn" data-x="clone">克隆环境（换新指纹）</button>
         <button class="btn" data-x="reseed">重新随机指纹（换一台"电脑"）</button>
         <button class="btn" data-x="force">强制打开（跳过代理检测）</button>
-        <button class="btn danger" data-x="del">删除环境（保留数据目录）</button>
+        <button class="btn" data-x="del">移入回收站</button>
         <button class="btn danger" data-x="purge">删除环境并清空 Cookie 数据</button>
       </div>`,
     footer: '<button class="btn" data-close>关闭</button>',
     onMount(root, close) {
+      const copy = root.querySelector('[data-x=copy-connect]');
+      if (copy) copy.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(connectCommand);
+          toast('已复制 AI 连接命令');
+        } catch {
+          root.querySelector('#ai-connect').select();
+          toast('已选中命令，可手动复制');
+        }
+      };
       const act = async (fn, msg) => {
         try { await fn(); close(); toast(msg); refresh(); } catch (e) { toast(e.message, 'err', 7000); }
       };
@@ -329,8 +365,8 @@ function moreMenu(p, btn) {
       root.querySelector('[data-x=reseed]').onclick = () => act(() => api(`/profiles/${p.id}/reseed`, { method: 'POST', body: {} }), '指纹已重新生成');
       root.querySelector('[data-x=force]').onclick = () => act(() => api(`/profiles/${p.id}/launch`, { method: 'POST', body: { force: true } }), '已强制打开（注意可能在用真实 IP）');
       root.querySelector('[data-x=del]').onclick = () => {
-        if (!confirm(`删除环境「${p.name}」？浏览器数据目录会保留在 profiles/ 下。`)) return;
-        act(() => api(`/profiles/${p.id}`, { method: 'DELETE' }), '已删除');
+        if (!confirm(`将「${p.name}」移入回收站？可在「设置与备份」恢复环境及其原数据目录。`)) return;
+        act(() => api(`/profiles/${p.id}`, { method: 'DELETE' }), '已移入回收站');
       };
       root.querySelector('[data-x=purge]').onclick = () => {
         if (!confirm(`彻底删除「${p.name}」？\n\n该环境的 Cookie、登录状态、缓存会一并抹掉，无法恢复。`)) return;
@@ -480,8 +516,9 @@ function profileModal(p) {
     return `
       <div class="field"><label>使用的浏览器内核</label><select class="input" data-f="engineId">
         <option value="">跟随默认（优先指纹内核）</option>
+        ${draft.engineId && !engines.some((e) => e.id === draft.engineId) ? `<option value="${esc(draft.engineId)}" selected>${esc(draft.engineId)}（当前不可用）</option>` : ''}
         ${engines.map((e) => `<option value="${esc(e.id)}" ${draft.engineId === e.id ? 'selected' : ''}>${esc(e.name)}${e.kind === 'system' ? '（弱指纹）' : ''}</option>`).join('')}
-      </select><div class="hint">系统自带 Chrome 只能做浅层伪装，正式养号请用 Fingerprint Chromium。</div></div>
+      </select><div class="hint">不同内核支持的设置有差异。指定内核后，打开环境前会检查它是否可用。</div></div>
       <div class="field"><label class="check"><input type="checkbox" data-f="automation" ${draft.automation ? 'checked' : ''}>
         开启自动化端口（Playwright / Puppeteer 可接管）</label></div>
       <div class="row">
@@ -896,20 +933,22 @@ function renderSettings() {
 
     <h3 style="font-size:14px;margin:30px 0 12px">备份与迁移</h3>
     <div class="callout">
-      导出的 JSON 包含全部环境配置、指纹和代理（含密码），换电脑时导入即可。<br>
-      <b>但不含 Cookie 登录态</b> —— 登录数据在 <code>profiles/</code> 目录里，要一起搬就把整个项目文件夹拷走。
+      加密备份包含环境配置、指纹和代理密码。换电脑导入时需要备份密码。<br>
+      Cookie 和登录状态保存在 <code>profiles/</code>，完整迁移请单独保管并复制项目文件夹。
     </div>
     <div style="display:flex;gap:8px">
-      <button class="btn" id="s-export">导出配置</button>
-      <button class="btn" id="s-import">导入配置</button>
+      <button class="btn primary" id="s-export">导出加密备份</button>
+      <button class="btn" id="s-import">导入备份</button>
+      <button class="btn" id="s-export-plain">导出明文 JSON</button>
+      <button class="btn" id="s-trash">环境回收站</button>
     </div>
 
-    <h3 style="font-size:14px;margin:30px 0 12px">给自动化脚本用的本地接口</h3>
+    <h3 style="font-size:14px;margin:30px 0 12px">让 AI 连接浏览器</h3>
     <div class="callout">
-      环境开启「自动化端口」后，用下面的接口拿 CDP 地址，Playwright / Puppeteer 直接接管：<br>
-      <code>GET ${esc(location.origin)}/api/v1/browser/start?profile_id=环境ID</code><br>
-      <code>GET .../api/v1/browser/stop?profile_id=环境ID</code> ·
-      <code>GET .../api/v1/user/list</code>
+      在环境的「编辑 → 高级」开启自动化端口，再打开环境。将以下命令交给可使用本机终端的 AI，在项目目录中运行：<br>
+      <code>npm run --silent cli -- list --json</code><br>
+      <code>npm run --silent cli -- connect 环境ID --json</code><br>
+      用返回的 <code>cdpUrl</code> 连接当前会话。连接后可读取页面，也可在该环境已登录的网站中操作。
     </div>`;
 
   $('#s-save').onclick = async () => {
@@ -926,21 +965,134 @@ function renderSettings() {
     toast('设置已保存');
     refresh();
   };
-  $('#s-export').onclick = () => { window.location.href = '/api/export'; };
+  $('#s-trash').onclick = async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    try {
+      const { profiles } = await api('/trash');
+      if (!button.isConnected) return;
+      modal({
+        title: '环境回收站',
+        body: profiles.length ? `<table><thead><tr><th>环境</th><th>移入时间</th><th>操作</th></tr></thead>
+          <tbody>${profiles.map((p) => `<tr><td>${esc(p.name)}<div class="sub">${esc(p.id)}</div></td>
+            <td>${esc(new Date(p.deletedAt).toLocaleString())}</td>
+            <td><button class="btn" data-restore="${esc(p.id)}">恢复</button></td></tr>`).join('')}</tbody></table>`
+          : '<p>回收站为空。</p>',
+        footer: '<button class="btn" data-close>关闭</button>',
+        onMount(root, close) {
+          root.onclick = async (event) => {
+            const restore = event.target.closest('[data-restore]');
+            if (!restore) return;
+            restore.disabled = true;
+            try {
+              await api(`/trash/${encodeURIComponent(restore.dataset.restore)}/restore`, { method: 'POST' });
+              close();
+              toast('已恢复到环境列表');
+              await refresh();
+            } catch (err) {
+              toast(err.message, 'err');
+              restore.disabled = false;
+            }
+          };
+        },
+      });
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      button.disabled = false;
+    }
+  };
+  $('#s-export').onclick = () => backupPasswordModal();
+  $('#s-export-plain').onclick = () => {
+    if (confirm('明文 JSON 包含环境配置和代理密码，任何拿到文件的人都能读取。继续导出？')) {
+      window.location.href = '/api/export';
+    }
+  };
   $('#s-import').onclick = () => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
     input.onchange = async () => {
-      const text = await input.files[0].text();
+      const file = input.files[0];
+      if (!file) return;
       try {
-        const r = await api('/import', { method: 'POST', body: JSON.parse(text) });
-        toast(`导入了 ${r.added} 个环境`);
-        refresh();
-      } catch (err) { toast(err.message, 'err'); }
+        const { maxFileSize, isEncryptedBackup } = await import('./backup.js');
+        if (file.size > maxFileSize) throw new Error('文件超过备份大小上限');
+        const backup = JSON.parse(await file.text());
+        if (isEncryptedBackup(backup)) backupPasswordModal(backup);
+        else await importBackup(backup);
+      } catch (err) { toast(err instanceof SyntaxError ? '备份文件不是有效的 JSON' : err.message, 'err'); }
     };
     input.click();
   };
+}
+
+async function importBackup(backup) {
+  const r = await api('/import', { method: 'POST', body: backup });
+  toast(`导入了 ${r.added} 个环境`);
+  await refresh().catch((err) => toast(`已导入，刷新列表失败：${err.message}`, 'err'));
+}
+
+function backupPasswordModal(backup) {
+  const exporting = !backup;
+  modal({
+    title: exporting ? '导出加密备份' : '导入加密备份',
+    body: `<form id="backup-form"><div class="field">
+      <label for="backup-password">备份密码</label>
+      <input id="backup-password" class="input" type="password" required
+        autocomplete="${exporting ? 'new-password' : 'current-password'}" ${exporting ? 'minlength="12"' : ''}>
+      </div>${exporting ? `<div class="field"><label for="backup-repeat">再次输入密码</label>
+        <input id="backup-repeat" class="input" type="password" required autocomplete="new-password"></div>
+        <p class="sub">请使用至少 12 个字符，并妥善保存。遗失密码后无法恢复备份。</p>` : ''}
+      <div role="alert" data-error></div></form>`,
+    footer: `<button class="btn" data-close>取消</button>
+      <button class="btn primary" form="backup-form" type="submit">${exporting ? '加密并下载' : '解密并导入'}</button>`,
+    onMount: (el, close) => {
+      const form = $('form', el);
+      const field = $('#backup-password', el);
+      const button = $('button[type="submit"]', el);
+      const error = $('[data-error]', el);
+      field.focus();
+      form.onsubmit = async (event) => {
+        event.preventDefault();
+        if (button.disabled) return;
+        const password = field.value;
+        if (exporting && password !== $('#backup-repeat', el).value) {
+          error.textContent = '两次输入的密码不一致';
+          $('#backup-repeat', el).focus();
+          return;
+        }
+        button.disabled = true;
+        error.textContent = '';
+        try {
+          const { encryptBackup, decryptBackup } = await import('./backup.js');
+          if (exporting) {
+            const res = await fetch('/api/export', { cache: 'no-store' });
+            if (!res.ok) throw new Error(`读取备份失败（HTTP ${res.status}）`);
+            const encrypted = await encryptBackup(await res.json(), password);
+            if (!el.isConnected) return;
+            const file = new Blob([JSON.stringify(encrypted)], { type: 'application/json' });
+            const url = URL.createObjectURL(file);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'fpb-backup-encrypted.json';
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
+          } else {
+            const plain = await decryptBackup(backup, password);
+            if (!el.isConnected) return;
+            await importBackup(plain);
+          }
+          close();
+        } catch (err) {
+          error.textContent = err.message;
+          field.focus();
+        } finally {
+          button.disabled = false;
+        }
+      };
+    },
+  });
 }
 
 // ================================================================ 通用弹窗
@@ -1006,10 +1158,35 @@ $('#add-group').onclick = async () => {
   refresh();
 };
 
-// 有环境在跑的时候定时刷新状态，浏览器被手动关掉了列表也能跟上
-setInterval(() => {
-  if (state.view === 'profiles' && state.profiles.some((p) => p.running) && !$('.overlay') && document.activeElement?.id !== 'search') {
-    refresh().catch((err) => toast(err.message, 'err'));
+function canSyncProfiles() {
+  return state.options && state.view === 'profiles' && !document.hidden && !$('.overlay')
+    && !document.activeElement?.matches('input, select, textarea');
+}
+
+let checkingProfiles = false;
+let lastSyncError = '';
+setInterval(async () => {
+  if (checkingProfiles || !canSyncProfiles()) return;
+  checkingProfiles = true;
+  try {
+    const response = await fetch('/api/v1/user/list');
+    if (!response.ok) throw new Error(`管理端响应异常（${response.status}）`);
+    const { data } = await response.json();
+    const changed = data.list.length !== state.profiles.length || data.list.some((entry, i) => {
+      const p = state.profiles[i];
+      return p.id !== entry.user_id || p.name !== entry.name || p.group !== entry.group_id
+        || p.notes !== entry.remark || p.running !== entry.running
+        || (p.runtime?.settingsWarning || '') !== (entry.settingsWarning || '');
+    });
+    if (changed && canSyncProfiles()) await refresh({ background: true });
+    lastSyncError = '';
+  } catch (err) {
+    if (canSyncProfiles() && err.message !== lastSyncError) {
+      toast(`环境列表同步失败：${err.message}`, 'err');
+      lastSyncError = err.message;
+    }
+  } finally {
+    checkingProfiles = false;
   }
 }, 5000);
 

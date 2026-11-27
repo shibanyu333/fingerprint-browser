@@ -5,6 +5,7 @@ import { load, save, newId, ROOT, isProfileId, removeProfileDir, profileDirSize 
 import { buildFingerprint, randomSeed, uaPreview, platformOptions, brandOptions, SCREEN_PRESETS, LOCALE_BY_COUNTRY } from './fingerprint.js';
 import { listEngines, installEngine, installState } from './engines.js';
 import { checkProxy } from './ipcheck.js';
+import { browserWsUrl } from './cdp-stealth.js';
 import { launchProfile, closeProfile, closeAll, isRunning, runtimeInfo, adoptOrphans, running } from './launcher.js';
 
 const db = load();
@@ -219,21 +220,53 @@ app.post('/api/profiles/:id/reseed', (req, res) => {
 app.delete('/api/profiles/:id', async (req, res, next) => {
   const { id } = req.params;
   if (!isProfileId(id)) return fail(res, '环境 ID 格式无效');
-  if (!db.profiles.some((p) => p.id === id)) return fail(res, '环境不存在', 404);
+  const profile = db.profiles.find((p) => p.id === id);
+  if (!profile) return fail(res, '环境不存在', 404);
   if (deleting.has(id)) return fail(res, '该环境正在删除', 409);
   deleting.add(id);
   try {
     await closeProfile(id);
     const profiles = db.profiles.filter((p) => p.id !== id);
-    if (req.query.purge === '1') removeProfileDir(id);
-    save({ ...db, profiles });
-    db.profiles = profiles;
+    let deletedProfiles = db.deletedProfiles;
+    if (req.query.purge === '1') {
+      if (profiles.some((p) => p.id.toLowerCase() === id.toLowerCase())
+          || deletedProfiles.some((entry) => entry.profile.id.toLowerCase() === id.toLowerCase())) {
+        return fail(res, '另一条环境记录使用同名目录，请先备份并检查环境 ID', 409);
+      }
+      removeProfileDir(id);
+    } else {
+      deletedProfiles = [{ profile, deletedAt: Date.now() }, ...deletedProfiles];
+    }
+    save({ ...db, profiles, deletedProfiles });
+    Object.assign(db, { profiles, deletedProfiles });
     ok(res);
   } catch (err) {
     next(err);
   } finally {
     deleting.delete(id);
   }
+});
+
+app.get('/api/trash', (_req, res) => {
+  const profiles = db.deletedProfiles.map(({ profile, deletedAt }) => ({
+    id: profile.id, name: profile.name, deletedAt,
+  }));
+  ok(res, { profiles });
+});
+
+app.post('/api/trash/:id/restore', (req, res) => {
+  const entry = db.deletedProfiles.find(({ profile }) => profile.id === req.params.id);
+  if (!entry) return fail(res, '回收站中没有这个环境', 404);
+  const { profile } = entry;
+  if (db.profiles.some((p) => p.id.toLowerCase() === profile.id.toLowerCase())) {
+    return fail(res, '环境 ID 已被占用，无法恢复到原目录', 409);
+  }
+  const group = db.groups.some((g) => g.id === profile.group) ? profile.group : 'default';
+  const profiles = [...db.profiles, { ...profile, group }];
+  const deletedProfiles = db.deletedProfiles.filter((item) => item !== entry);
+  save({ ...db, profiles, deletedProfiles });
+  Object.assign(db, { profiles, deletedProfiles });
+  ok(res, { id: profile.id });
 });
 
 // ---------------------------------------------------------------- 打开 / 关闭
@@ -503,13 +536,17 @@ app.post('/api/import', (req, res) => {
   const groups = new Map(db.groups.map((g) => [g.id, g]));
   const proxies = new Map(db.proxies.map((p) => [p.id, p]));
   const profiles = new Map(db.profiles.map((p) => [p.id, p]));
+  // macOS 默认文件系统不区分大小写，回收站的原目录在恢复前也属于原环境。
+  const reserved = new Set([...profiles.keys(), ...db.deletedProfiles.map((e) => e.profile.id)]
+    .map((id) => id.toLowerCase()));
   for (const g of entries.groups) if (!groups.has(g.id)) groups.set(g.id, g);
   for (const px of entries.proxies) if (!proxies.has(px.id)) proxies.set(px.id, px);
   for (const p of entries.profiles) {
-    const profile = profiles.has(p.id) || deleting.has(p.id)
+    const profile = reserved.has(p.id.toLowerCase())
       ? { ...p, id: newId('env'), name: `${p.name}-导入` }
       : p;
     profiles.set(profile.id, profile);
+    reserved.add(profile.id.toLowerCase());
   }
   const updated = { groups: [...groups.values()], proxies: [...proxies.values()], profiles: [...profiles.values()] };
   save({ ...db, ...updated });
@@ -519,6 +556,23 @@ app.post('/api/import', (req, res) => {
 
 // ---------------------------------------------------------------- 自动化本地接口
 // 给 Playwright / Puppeteer 脚本用：拿到 CDP 地址直接接管浏览器。
+
+app.get('/api/profiles/:id/connection', async (req, res, next) => {
+  try {
+    const profile = db.profiles.find((p) => p.id === req.params.id);
+    if (!profile) return fail(res, '环境不存在', 404);
+    if (!profile.automation) return fail(res, '请先在环境的高级设置中开启自动化端口', 403);
+    if (!isRunning(profile.id)) return fail(res, '环境尚未运行，请先打开环境', 409);
+    const port = runtimeInfo(profile.id)?.cdpPort;
+    if (!port) return fail(res, '当前会话没有可连接的端口，请关闭并重新打开此环境', 409);
+    if (!await browserWsUrl(port, 12) || port !== runtimeInfo(profile.id)?.cdpPort) {
+      return fail(res, '浏览器连接尚未就绪，请稍后重试', 503);
+    }
+    return ok(res, { profileId: profile.id, cdpPort: port, cdpUrl: `http://127.0.0.1:${port}` });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /** 自动化接口统一支持用环境 ID 或名字定位 */
 const findProfile = (idOrName) => db.profiles.find((x) => x.id === idOrName || x.name === idOrName) || null;
@@ -558,7 +612,11 @@ app.get('/api/v1/user/list', (_req, res) => {
   res.json({
     code: 0,
     data: {
-      list: db.profiles.map((p) => ({ user_id: p.id, name: p.name, group_id: p.group, remark: p.notes })),
+      list: db.profiles.map((p) => ({
+        user_id: p.id, name: p.name, group_id: p.group, remark: p.notes,
+        running: isRunning(p.id), automation: !!p.automation,
+        settingsWarning: running.get(p.id)?.settingsWarning || '',
+      })),
     },
   });
 });

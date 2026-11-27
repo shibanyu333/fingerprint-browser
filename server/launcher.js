@@ -103,7 +103,13 @@ function buildArgs(profile, engine, ctx) {
   // 注意：ICU 默认 locale 不由 --lang 决定，见下面的 applyAppleLanguages()
 
   if (fp.customArgs) {
-    for (const a of String(fp.customArgs).split(/\s+/).filter(Boolean)) args.push(a);
+    const extra = String(fp.customArgs).split(/\s+/).filter(Boolean);
+    for (const arg of extra) {
+      if (/^--?(user-data-dir|profile-directory|disk-cache-dir)(=|$)/i.test(arg)) {
+        throw new Error('环境的数据和缓存目录由管理端分配，请移除自定义启动参数中的目录设置');
+      }
+    }
+    args.push(...extra);
   }
   if (profile.startUrl) args.push('--', profile.startUrl);
   return args;
@@ -300,7 +306,10 @@ async function startProfile(profile, opts) {
         if (running.get(profile.id) === state) state.detachStealth = detach;
         else detach();
       })
-      .catch((err) => console.error(`[patch] ${profile.name}: ${err.message}`));
+      .catch((err) => {
+        state.settingsWarning = '部分浏览器设置未能应用';
+        console.error(`[patch] ${profile.name}: ${err.message}`);
+      });
   }
 
   // 记录一下最近一次的运行信息，列表里能直接看到出口 IP
@@ -412,6 +421,7 @@ export function runtimeInfo(id) {
     cdpPort: r.cdpPort,
     engineName: r.engineName,
     adopted: !!r.adopted,
+    settingsWarning: r.settingsWarning || '',
     traffic: r.relay ? { up: r.relay.stats.up, down: r.relay.stats.down, errors: r.relay.stats.errors, lastError: r.relay.stats.lastError } : null,
   };
 }

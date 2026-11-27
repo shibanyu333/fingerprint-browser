@@ -94,7 +94,7 @@ const patchScript = (fp) => `
 })();
 `;
 
-async function browserWsUrl(port, tries = 60) {
+export async function browserWsUrl(port, tries = 60) {
   for (let i = 0; i < tries; i++) {
     const url = await new Promise((resolve) => {
       const req = http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 1000 }, (res) => {
